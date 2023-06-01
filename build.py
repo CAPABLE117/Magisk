@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import errno
+import glob
 import lzma
 import multiprocessing
 import os
@@ -10,9 +11,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import textwrap
 import urllib.request
-import tarfile
 from zipfile import ZipFile
 
 
@@ -59,6 +60,8 @@ if "ANDROID_SDK_ROOT" not in os.environ:
     error("Please set Android SDK path to environment variable ANDROID_SDK_ROOT!")
 
 cpu_count = multiprocessing.cpu_count()
+os_name = platform.system().lower()
+
 archs = ["armeabi-v7a", "x86", "arm64-v8a", "x86_64"]
 triples = [
     "armv7a-linux-androideabi",
@@ -70,11 +73,14 @@ default_targets = ["magisk", "magiskinit", "magiskboot", "magiskpolicy", "busybo
 support_targets = default_targets + ["resetprop"]
 rust_targets = ["magisk", "magiskinit", "magiskboot", "magiskpolicy"]
 
-sdk_path = os.environ["ANDROID_SDK_ROOT"]
+sdk_path = op.realpath(os.environ["ANDROID_SDK_ROOT"])
 ndk_root = op.join(sdk_path, "ndk")
 ndk_path = op.join(ndk_root, "magisk")
 ndk_build = op.join(ndk_path, "ndk-build")
 rust_bin = op.join(ndk_path, "toolchains", "rust", "bin")
+llvm_bin = op.join(
+    ndk_path, "toolchains", "llvm", "prebuilt", f"{os_name}-x86_64", "bin"
+)
 cargo = op.join(rust_bin, "cargo" + EXE_EXT)
 gradlew = op.join(".", "gradlew" + (".bat" if is_windows else ""))
 adb_path = op.join(sdk_path, "platform-tools", "adb" + EXE_EXT)
@@ -236,6 +242,16 @@ def run_ndk_build(flags):
             mv(source, target)
 
 
+def run_cargo(cmds, triple="aarch64-linux-android"):
+    env = os.environ.copy()
+    env["PATH"] = f'{rust_bin}:{env["PATH"]}'
+    env["CARGO_BUILD_RUSTC"] = op.join(rust_bin, "rustc" + EXE_EXT)
+    env["RUSTFLAGS"] = "-Clinker-plugin-lto"
+    env["TARGET_CC"] = op.join(llvm_bin, "clang" + EXE_EXT)
+    env["TARGET_CFLAGS"] = f"--target={triple}23"
+    return execv([cargo, *cmds], env)
+
+
 def run_cargo_build(args):
     os.chdir(op.join("native", "src"))
     native_out = op.join("..", "out")
@@ -245,11 +261,8 @@ def run_cargo_build(args):
     if "resetprop" in args.target:
         targets.add("magisk")
 
-    env = os.environ.copy()
-    env["CARGO_BUILD_RUSTC"] = op.join(rust_bin, "rustc" + EXE_EXT)
-
     # Start building the actual build commands
-    cmds = [cargo, "build"]
+    cmds = ["build"]
     for target in targets:
         cmds.append("-p")
         cmds.append(target)
@@ -260,18 +273,15 @@ def run_cargo_build(args):
     if not args.verbose:
         cmds.append("-q")
 
-    os_name = platform.system().lower()
-    llvm_bin = op.join(
-        ndk_path, "toolchains", "llvm", "prebuilt", f"{os_name}-x86_64", "bin"
-    )
-    env["TARGET_CC"] = op.join(llvm_bin, "clang" + EXE_EXT)
-    env["RUSTFLAGS"] = "-Clinker-plugin-lto"
+    cmds.append("--target")
+    cmds.append("")
+
     for arch, triple in zip(archs, triples):
-        env["TARGET_CFLAGS"] = f"--target={triple}23"
         rust_triple = (
             "thumbv7neon-linux-androideabi" if triple.startswith("armv7") else triple
         )
-        proc = execv([*cmds, "--target", rust_triple], env)
+        cmds[-1] = rust_triple
+        proc = run_cargo(cmds, triple)
         if proc.returncode != 0:
             error("Build binary failed!")
 
@@ -282,6 +292,16 @@ def run_cargo_build(args):
             target = op.join(arch_out, f"lib{tgt}-rs.a")
             mv(source, target)
 
+    os.chdir(op.join("..", ".."))
+
+
+def run_cargo_cmd(args):
+    global STDOUT
+    STDOUT = None
+    if len(args.commands) >= 1 and args.commands[0] == "--":
+        args.commands = args.commands[1:]
+    os.chdir(op.join("native", "src"))
+    run_cargo(args.commands)
     os.chdir(op.join("..", ".."))
 
 
@@ -490,7 +510,9 @@ def cleanup(args):
         rm_rf(op.join("native", "obj"))
         rm_rf(op.join("native", "out"))
         rm_rf(op.join("native", "src", "target"))
-        rm_rf(op.join("native", "src", "external", "cxx-rs", "target"))
+        rm(op.join("native", "src", "boot", "update_metadata.rs"))
+        for rs_gen in glob.glob("native/**/*-rs.*pp", recursive=True):
+            rm(rs_gen)
 
     if "java" in args.target:
         header("* Cleaning java")
@@ -500,7 +522,6 @@ def cleanup(args):
 
 
 def setup_ndk(args):
-    os_name = platform.system().lower()
     ndk_ver = config["ondkVersion"]
     url = f"https://github.com/topjohnwu/ondk/releases/download/{ndk_ver}/ondk-{ndk_ver}-{os_name}.tar.gz"
     ndk_archive = url.split("/")[-1]
@@ -640,6 +661,10 @@ binary_parser.add_argument(
     or empty for defaults ({', '.join(default_targets)})",
 )
 binary_parser.set_defaults(func=build_binary)
+
+cargo_parser = subparsers.add_parser("cargo", help="run cargo with proper environment")
+cargo_parser.add_argument("commands", nargs=argparse.REMAINDER)
+cargo_parser.set_defaults(func=run_cargo_cmd)
 
 app_parser = subparsers.add_parser("app", help="build the Magisk app")
 app_parser.set_defaults(func=build_app)
